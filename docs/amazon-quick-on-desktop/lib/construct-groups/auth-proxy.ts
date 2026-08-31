@@ -45,6 +45,17 @@ export class AuthProxy extends Construct {
 
     authorize.addMethod('GET', integration);
     token.addMethod('POST', integration);
+
+    // A REST API resource policy only takes effect once the stage is
+    // redeployed. Changing only `allowedCidrs` does not alter any resource or
+    // method, so CDK would reuse the existing deployment and the new policy
+    // would never reach the stage: the API keeps serving under the old policy
+    // while the console shows the new one. Mixing the policy into the
+    // deployment's logical ID forces a fresh deployment whenever it changes,
+    // including when the restriction is removed.
+    this.api.latestDeployment?.addToLogicalId({
+      resourcePolicyAllowedCidrs: allowedCidrs ?? null,
+    });
   }
 
   private createResourcePolicy(allowedCidrs: string[]): PolicyDocument {
