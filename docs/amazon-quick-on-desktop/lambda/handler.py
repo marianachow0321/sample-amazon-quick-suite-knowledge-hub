@@ -12,6 +12,8 @@ from enum import Enum, StrEnum
 class Route(StrEnum):
     AUTHORIZE = "/oauth2/authorize"
     TOKEN = "/oauth2/token"
+    USERINFO = "/oauth2/userInfo"
+    USERINFO_LOWER = "/oauth2/userinfo"
 
 
 class HttpMethod(StrEnum):
@@ -21,6 +23,7 @@ class HttpMethod(StrEnum):
 
 class StatusCode(int, Enum):
     REDIRECT = 302
+    UNAUTHORIZED = 401
     NOT_FOUND = 404
     INTERNAL_ERROR = 500
     BAD_GATEWAY = 502
@@ -72,9 +75,9 @@ class TokenHandler:
             body = base64.b64decode(body).decode()
 
         headers = {"Content-Type": ContentType.FORM.value}
-        req_headers = event.get("headers") or {}
-        if "authorization" in req_headers:
-            headers["Authorization"] = req_headers["authorization"]
+        authorization = find_header(event.get("headers"), "Authorization")
+        if authorization:
+            headers["Authorization"] = authorization
 
         req = urllib.request.Request(
             f"{self._cognito_domain}{Route.TOKEN.value}",
@@ -103,9 +106,67 @@ class TokenHandler:
             )
 
 
+def find_header(headers: dict | None, name: str) -> str | None:
+    """API Gateway preserves the client's header casing, so match case-insensitively."""
+    target = name.lower()
+    for key, value in (headers or {}).items():
+        if key.lower() == target:
+            return value
+    return None
+
+
+class UserInfoHandler:
+    """Forwards OIDC userInfo requests to Cognito.
+
+    The Amazon Quick extension configuration has no userInfo field, so a client
+    that does not read the issuer's discovery document may derive the endpoint
+    from the token endpoint it was given — which points here, not at Cognito.
+    Without this route API Gateway rejects the request before it reaches Cognito
+    and sign-in fails after a successful token exchange.
+    """
+
+    def __init__(self, cognito_domain: str) -> None:
+        self._cognito_domain = cognito_domain
+
+    def handle(self, event: dict) -> ProxyResponse:
+        authorization = find_header(event.get("headers"), "Authorization")
+        if not authorization:
+            return ProxyResponse(
+                statusCode=StatusCode.UNAUTHORIZED,
+                headers={"Content-Type": ContentType.JSON.value},
+                body='{"error": "invalid_token", "error_description": "Missing Authorization header"}',
+            )
+
+        req = urllib.request.Request(
+            f"{self._cognito_domain}{Route.USERINFO.value}",
+            headers={"Authorization": authorization},
+            method=HttpMethod.GET.value,
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return ProxyResponse(
+                    statusCode=resp.status,
+                    headers={"Content-Type": ContentType.JSON.value},
+                    body=resp.read().decode(),
+                )
+        except urllib.error.HTTPError as e:
+            return ProxyResponse(
+                statusCode=e.code,
+                headers={"Content-Type": ContentType.JSON.value},
+                body=e.read().decode(),
+            )
+        except urllib.error.URLError as e:
+            return ProxyResponse(
+                statusCode=StatusCode.BAD_GATEWAY,
+                headers={"Content-Type": ContentType.JSON.value},
+                body=f'{{"error": "upstream_unreachable", "reason": "{e.reason}"}}',
+            )
+
+
 COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
 authorize_handler = AuthorizeHandler(COGNITO_DOMAIN)
 token_handler = TokenHandler(COGNITO_DOMAIN)
+userinfo_handler = UserInfoHandler(COGNITO_DOMAIN)
 
 
 def handler(event: dict, _context: object) -> dict:
@@ -119,6 +180,8 @@ def handler(event: dict, _context: object) -> dict:
                 response = authorize_handler.handle(event)
             case (Route.TOKEN, HttpMethod.POST):
                 response = token_handler.handle(event)
+            case ((Route.USERINFO | Route.USERINFO_LOWER), (HttpMethod.GET | HttpMethod.POST)):
+                response = userinfo_handler.handle(event)
             case _:
                 response = ProxyResponse(
                     statusCode=StatusCode.NOT_FOUND, body="Not found"

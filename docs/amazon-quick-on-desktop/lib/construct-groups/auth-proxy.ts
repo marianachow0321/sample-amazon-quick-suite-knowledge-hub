@@ -46,6 +46,19 @@ export class AuthProxy extends Construct {
     authorize.addMethod('GET', integration);
     token.addMethod('POST', integration);
 
+    // The Amazon Quick extension configuration has no userInfo field, so a
+    // client that does not read the issuer's discovery document may derive the
+    // endpoint from the token endpoint it was given — which points at this API,
+    // not at Cognito. Without these routes API Gateway rejects the request
+    // before it reaches the Lambda and sign-in fails after a successful token
+    // exchange. Both casings are registered because API Gateway path parts are
+    // case-sensitive and clients differ; Cognito itself advertises `userInfo`.
+    for (const name of ['userInfo', 'userinfo']) {
+      const userInfo = oauth2.addResource(name);
+      userInfo.addMethod('GET', integration);
+      userInfo.addMethod('POST', integration);
+    }
+
     // A REST API resource policy only takes effect once the stage is
     // redeployed. Changing only `allowedCidrs` does not alter any resource or
     // method, so CDK would reuse the existing deployment and the new policy
