@@ -75,6 +75,7 @@ class StackOutputResponse:
 @dataclass(frozen=True)
 class SyncRequest:
     source: UserSource
+    suppress: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,18 +167,27 @@ class CognitoUserSyncer:
                 results.append(UserSyncResult(user=user, status=SyncStatus.CREATED))
         return results
 
-    def create(self, user: SyncUser) -> None:
-        """Creates a user. Cognito emails an invitation with a temporary password."""
+    def create(self, user: SyncUser, *, suppress: bool = False) -> None:
+        """Creates a user.
+
+        When *suppress* is False (default), Cognito emails an invitation with
+        a temporary password.  When True, the invite email is suppressed and
+        the user can set their password via the "Forgot Password" flow.
+        """
         attrs = [{"Name": "email_verified", "Value": "true"}]
         if user.email:
             attrs.append({"Name": "email", "Value": user.email})
 
-        self._cognito.admin_create_user(
+        kwargs: dict = dict(
             UserPoolId=self._pool_id,
             Username=user.username,
             UserAttributes=attrs,
             DesiredDeliveryMediums=["EMAIL"],
         )
+        if suppress:
+            kwargs["MessageAction"] = "SUPPRESS"
+
+        self._cognito.admin_create_user(**kwargs)
 
     def resend_invite(self, user: SyncUser) -> None:
         """Resends the invitation email to a user who has not yet signed in."""
@@ -248,8 +258,14 @@ class UserSyncOrchestrator:
                         skipped += 1
                         continue
                     try:
-                        syncer.create(result.user)
-                        print(f"    INVITED: {result.user.username}")
+                        syncer.create(result.user, suppress=request.suppress)
+                        if request.suppress:
+                            print(
+                                f"    CREATED (no email): {result.user.username}"
+                                " — user can set password via Forgot Password"
+                            )
+                        else:
+                            print(f"    INVITED: {result.user.username}")
                         created += 1
                     except (BotoCoreError, ClientError) as e:
                         print(f"    FAILED:  {result.user.username}: {e}")
@@ -283,6 +299,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", type=UserSource, default=UserSource.IDC, choices=list(UserSource)
     )
+    parser.add_argument(
+        "--suppress",
+        action="store_true",
+        help="Suppress invitation emails. Users set their password via Forgot Password.",
+    )
     args = parser.parse_args()
 
     session = boto3.Session()
@@ -302,7 +323,7 @@ if __name__ == "__main__":
     )
 
     try:
-        orchestrator.run(SyncRequest(source=args.source))
+        orchestrator.run(SyncRequest(source=args.source, suppress=args.suppress))
     except (SyncError, BotoCoreError, ClientError) as e:
         sys.exit(f"ERROR: {e}")
     except Exception as e:
