@@ -9,6 +9,8 @@ sets their own password on first sign-in.
 Usage:
     python3 sync_users.py --source idc    # from IAM Identity Center
     python3 sync_users.py --source local  # from local Amazon Quick users
+    python3 sync_users.py --users alice,bob -y        # only these users, no prompts
+    python3 sync_users.py --users-file users.txt -y   # one username per line
 """
 
 import argparse
@@ -76,6 +78,10 @@ class StackOutputResponse:
 class SyncRequest:
     source: UserSource
     suppress: bool = False
+    # Lower-cased usernames to sync; None means sync every user in the source.
+    usernames: frozenset[str] | None = None
+    # Skip y/n prompts: invite new users and resend to existing ones.
+    assume_yes: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,7 +225,10 @@ class UserSyncOrchestrator:
         self._idc_lister_factory = idc_lister_factory
         self._local_lister_factory = local_lister_factory
 
-    def _confirm(self, prompt: str) -> bool:
+    def _confirm(self, prompt: str, assume_yes: bool = False) -> bool:
+        if assume_yes:
+            print(f"{prompt} [auto-yes]")
+            return True
         while True:
             response = input(f"{prompt} [y/n] ").strip().lower()
             match response:
@@ -241,6 +250,14 @@ class UserSyncOrchestrator:
                 print("Source: Local Amazon Quick users")
                 users = self._local_lister_factory().list_users()
 
+        if request.usernames is not None:
+            all_users = list(users)
+            users = [u for u in all_users if u.username.lower() in request.usernames]
+            found = {u.username.lower() for u in users}
+            for missing in sorted(request.usernames - found):
+                print(f"WARNING: '{missing}' not found in source; ignoring.")
+            print(f"Filter:  {len(users)} of {len(all_users)} source users selected")
+
         print(f"Pool:    {stack.pool_id}\n")
 
         syncer = self._syncer_factory(stack.pool_id)
@@ -253,7 +270,8 @@ class UserSyncOrchestrator:
                     skipped += 1
                 case SyncStatus.CREATED:
                     if not self._confirm(
-                        f"  Invite {result.user.username} ({result.user.email})?"
+                        f"  Invite {result.user.username} ({result.user.email})?",
+                        request.assume_yes,
                     ):
                         skipped += 1
                         continue
@@ -272,7 +290,8 @@ class UserSyncOrchestrator:
                         failed += 1
                 case SyncStatus.EXISTS:
                     if not self._confirm(
-                        f"  {result.user.username} exists. Resend invitation?"
+                        f"  {result.user.username} exists. Resend invitation?",
+                        request.assume_yes,
                     ):
                         skipped += 1
                         continue
@@ -304,7 +323,39 @@ if __name__ == "__main__":
         action="store_true",
         help="Suppress invitation emails. Users set their password via Forgot Password.",
     )
+    parser.add_argument(
+        "--users",
+        help="Comma-separated usernames to sync (case-insensitive). Default: all.",
+    )
+    parser.add_argument(
+        "--users-file",
+        help="File with one username per line (blank lines and # comments ignored).",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip prompts: invite new users and resend to existing ones.",
+    )
     args = parser.parse_args()
+
+    usernames: frozenset[str] | None = None
+    if args.users or args.users_file:
+        names: set[str] = set()
+        if args.users:
+            names.update(n.strip().lower() for n in args.users.split(",") if n.strip())
+        if args.users_file:
+            try:
+                with open(args.users_file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.split("#", 1)[0].strip()
+                        if line:
+                            names.add(line.lower())
+            except OSError as e:
+                sys.exit(f"ERROR: cannot read --users-file: {e}")
+        if not names:
+            sys.exit("ERROR: --users/--users-file given but no usernames found.")
+        usernames = frozenset(names)
 
     session = boto3.Session()
     cognito = session.client("cognito-idp")
@@ -323,7 +374,14 @@ if __name__ == "__main__":
     )
 
     try:
-        orchestrator.run(SyncRequest(source=args.source, suppress=args.suppress))
+        orchestrator.run(
+            SyncRequest(
+                source=args.source,
+                suppress=args.suppress,
+                usernames=usernames,
+                assume_yes=args.yes,
+            )
+        )
     except (SyncError, BotoCoreError, ClientError) as e:
         sys.exit(f"ERROR: {e}")
     except Exception as e:
