@@ -53,6 +53,7 @@ curl -s -o /dev/null -D - -G "$AUTH" \
 # 6. Create users. Add them to IAM Identity Center first, then run the script —
 #    it discovers the pool from the stack, shows a plan, and prompts per user.
 python3 scripts/sync_users.py --source idc      # or --source local
+#    More than ~50 users? Read "Bulk users" below first — Cognito caps invites.
 ```
 
 The script needs Python 3.11+ (it imports `StrEnum`), so it will not run on
@@ -114,6 +115,65 @@ Three rules behind most failures:
 - Destroying and redeploying? Delete the retained log group first, or the deploy
   fails with `already exists`:
   `aws logs delete-log-group --log-group-name /aws/lambda/QuickDesktopAuthProxyFunction`
+
+---
+
+## Bulk users and the 50 emails/day limit
+
+Cognito's built-in email sender allows **50 emails per day per pool**. Past that,
+every invite fails with `LimitExceededException`, and the users stay uncreated
+or un-invited until the next day.
+
+**Option A — invite in batches.** `sync_users.py` can target a subset and skip
+the per-user prompts. Names match case-insensitively; names not found in the
+source are reported and ignored.
+
+```bash
+python3 scripts/sync_users.py --users alice,bob -y
+python3 scripts/sync_users.py --users-file batch1.txt -y   # one name per line, # comments ok
+```
+
+Pass the **source username**, not the email. It is compared to the IdC
+`UserName`, or to the Quick `UserName` with `--source local`. Dotted names such
+as `mariana.chow` work as-is. The pool makes email a sign-in alias
+(`signInAliases: { username: true, email: true }`), so Cognito **rejects
+usernames that look like an email**. An IdC user whose username is
+`someone@example.com` fails at creation, whatever you pass to `--users`.
+
+With `-y`, new users are invited and existing ones get the invitation
+**resent**. A resend only works while the user is still in
+`FORCE_CHANGE_PASSWORD`, issues a new temporary password, and still counts
+toward the 50. Invitation passwords expire after 7 days by default.
+
+**Option B — no email, hand out passwords.** Create the users without email,
+then set permanent passwords and distribute them yourself:
+
+```bash
+python3 scripts/sync_users.py --source idc --suppress -y
+python3 scripts/reset_passwords.py $POOL            # writes passwords.csv
+```
+
+`reset_passwords.py` sets a random 12-character **permanent** password for
+**every** user in the pool, after one confirmation. That includes users who
+already chose their own password, so run it before anyone signs in, or against
+a pool you're happy to reset. Users end up `CONFIRMED`, and those passwords
+never expire. Afterwards users can change the password themselves or use
+Forgot Password.
+
+Do not stop after `--suppress` alone. A user created without email is stuck in
+`FORCE_CHANGE_PASSWORD` with a password nobody knows, and Cognito refuses
+Forgot Password in that state ("Could not reset password for the account"). The
+`reset_passwords.py` step is what makes the account usable.
+
+`passwords.csv` holds plaintext passwords. Keep it out of git, share it over a
+secure channel, and delete it once the passwords are handed out.
+
+**Option C — lift the limit.** Configure the pool to send through SES
+(`EmailSendingAccount: DEVELOPER`), ideally in
+`lib/construct-groups/identity-provider.ts`, so it survives redeploys. Do not do
+this with `aws cognito-idp update-user-pool`: that call resets every setting you
+don't pass (email, MFA, Lambda triggers, verification) to its default. If you
+already ran it, check with `describe-user-pool` and redeploy to restore.
 
 ---
 
@@ -341,6 +401,8 @@ scheduled Lambda or drive it from SCIM.
 | `netstat`/`lsof` shows nothing on 18080 | Normal when idle; only meaningful during a sign-in. |
 | "Incorrect username or password" at the hosted UI | Usually the invitation email never arrived, or the password is from a pool that no longer exists. Create the user in the Cognito console with a password you set, and tick "Mark email address as verified". |
 | "User info request failed (HTTP 401)" after a successful token exchange | The client presented something other than the access token. Cognito's userInfo rejects ID tokens. |
+| `LimitExceededException` from `sync_users.py` | 50 emails/day cap of Cognito's built-in sender. Batch with `--users`, or see "Bulk users". |
+| Forgot Password: "Could not reset password for the account" | User is in `FORCE_CHANGE_PASSWORD` (e.g. created with `--suppress`). Run `reset_passwords.py` or `admin-set-user-password --permanent`. |
 | Browser opens Quick sign-in instead of Cognito | No active Quick web session — do step 8 first. |
 | Cannot sign in to Quick web at all | IdC `AssignmentRequired: true` and the user is in no assigned group. |
 | Sign-in succeeds but no Quick session | Email mismatch between the Cognito user and the Quick user. |
