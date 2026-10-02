@@ -130,6 +130,7 @@ source are reported and ignored.
 
 ```bash
 python3 scripts/sync_users.py --users alice,bob -y
+python3 scripts/sync_users.py --source idc --users mariana.chow,john.doe -y
 python3 scripts/sync_users.py --users-file batch1.txt -y   # one name per line, # comments ok
 ```
 
